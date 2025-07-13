@@ -2,7 +2,6 @@ package qupansou
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 
 	"pansou/model"
 	"pansou/plugin"
+	"pansou/util/json"
 )
 
 // 在init函数中注册插件

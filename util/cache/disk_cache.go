@@ -3,12 +3,13 @@ package cache
 import (
 	"crypto/md5"
 	"encoding/hex"
-	"encoding/json"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+	
+	"pansou/util/json"
 )
 
 // 磁盘缓存项元数据

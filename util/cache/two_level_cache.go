@@ -165,11 +165,16 @@ func NewTwoLevelCache() (*TwoLevelCache, error) {
 
 // 设置缓存
 func (c *TwoLevelCache) Set(key string, data []byte, ttl time.Duration) error {
-	// 先设置内存缓存
+	// 先设置内存缓存（这是快速操作，直接在当前goroutine中执行）
 	c.memCache.Set(key, data, ttl)
 	
-	// 再设置磁盘缓存
-	return c.diskCache.Set(key, data, ttl)
+	// 异步设置磁盘缓存（这是IO操作，可能较慢）
+	go func(k string, d []byte, t time.Duration) {
+		// 使用独立的goroutine写入磁盘，避免阻塞调用者
+		_ = c.diskCache.Set(k, d, t)
+	}(key, data, ttl)
+	
+	return nil
 }
 
 // 获取缓存

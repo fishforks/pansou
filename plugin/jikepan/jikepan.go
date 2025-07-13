@@ -2,14 +2,15 @@ package jikepan
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"pansou/model"
 	"pansou/plugin"
+	"pansou/util/json"
 )
 
 // 在init函数中注册插件
@@ -19,19 +20,19 @@ func init() {
 }
 
 const (
-	// JikepanAPIURL 极客盘API地址
+	// JikepanAPIURL 即刻盘API地址
 	JikepanAPIURL = "https://api.jikepan.xyz/search"
 	// DefaultTimeout 默认超时时间
-	DefaultTimeout = 10 * time.Second
+	DefaultTimeout = 6 * time.Second
 )
 
-// JikepanPlugin 极客盘搜索插件
+// JikepanPlugin 即刻盘搜索插件
 type JikepanPlugin struct {
 	client  *http.Client
 	timeout time.Duration
 }
 
-// NewJikepanPlugin 创建新的极客盘搜索插件
+// NewJikepanPlugin 创建新的即刻盘搜索插件
 func NewJikepanPlugin() *JikepanPlugin {
 	timeout := DefaultTimeout
 	
@@ -84,7 +85,12 @@ func (p *JikepanPlugin) Search(keyword string) ([]model.SearchResult, error) {
 	
 	// 解析响应
 	var apiResp JikepanResponse
-	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response body failed: %w", err)
+	}
+	
+	if err := json.Unmarshal(bodyBytes, &apiResp); err != nil {
 		return nil, fmt.Errorf("decode response failed: %w", err)
 	}
 	

@@ -13,7 +13,6 @@ import (
 	"pansou/plugin"
 	"pansou/util"
 	"pansou/util/cache"
-	"pansou/util/json"
 	"pansou/util/pool"
 )
 
@@ -60,8 +59,77 @@ func NewSearchService(pluginManager *plugin.PluginManager) *SearchService {
 
 // Search 执行搜索
 func (s *SearchService) Search(keyword string, channels []string, concurrency int, forceRefresh bool, resultType string, sourceType string, plugins []string) (model.SearchResponse, error) {
+	// 参数预处理
+	// 源类型标准化
+	if sourceType == "" {
+		sourceType = "all"
+	}
+	
+	// 插件参数规范化处理
+	if sourceType == "tg" {
+		// 对于只搜索Telegram的请求，忽略插件参数
+		plugins = nil
+	} else if sourceType == "all" || sourceType == "plugin" {
+		// 检查是否为空列表或只包含空字符串
+		if plugins == nil || len(plugins) == 0 {
+			plugins = nil
+		} else {
+			// 检查是否有非空元素
+			hasNonEmpty := false
+			for _, p := range plugins {
+				if p != "" {
+					hasNonEmpty = true
+					break
+				}
+			}
+			
+			// 如果全是空字符串，视为未指定
+			if !hasNonEmpty {
+				plugins = nil
+			} else {
+				// 检查是否包含所有插件
+				allPlugins := s.pluginManager.GetPlugins()
+				allPluginNames := make([]string, 0, len(allPlugins))
+				for _, p := range allPlugins {
+					allPluginNames = append(allPluginNames, strings.ToLower(p.Name()))
+				}
+				
+				// 创建请求的插件名称集合（忽略空字符串）
+				requestedPlugins := make([]string, 0, len(plugins))
+				for _, p := range plugins {
+					if p != "" {
+						requestedPlugins = append(requestedPlugins, strings.ToLower(p))
+					}
+				}
+				
+				// 如果请求的插件数量与所有插件数量相同，检查是否包含所有插件
+				if len(requestedPlugins) == len(allPluginNames) {
+					// 创建映射以便快速查找
+					pluginMap := make(map[string]bool)
+					for _, p := range requestedPlugins {
+						pluginMap[p] = true
+					}
+					
+					// 检查是否包含所有插件
+					allIncluded := true
+					for _, name := range allPluginNames {
+						if !pluginMap[name] {
+							allIncluded = false
+							break
+						}
+					}
+					
+					// 如果包含所有插件，统一设为nil
+					if allIncluded {
+						plugins = nil
+					}
+				}
+			}
+		}
+	}
+
 	// 立即生成缓存键并检查缓存
-	cacheKey := cache.GenerateCacheKey(keyword, nil)
+	cacheKey := cache.GenerateCacheKey(keyword, channels, sourceType, plugins)
 	
 	// 如果未启用强制刷新，尝试从缓存获取结果
 	if !forceRefresh && twoLevelCache != nil && config.AppConfig.CacheEnabled {
@@ -69,7 +137,7 @@ func (s *SearchService) Search(keyword string, channels []string, concurrency in
 		
 		if err == nil && hit {
 			var response model.SearchResponse
-			if err := json.Unmarshal(data, &response); err == nil {
+			if err := cache.DeserializeWithPool(data, &response); err == nil {
 				// 根据resultType过滤返回结果
 				return filterResponseByType(response, resultType), nil
 			}
@@ -225,7 +293,7 @@ func (s *SearchService) Search(keyword string, channels []string, concurrency in
 	// 异步缓存搜索结果（缓存完整结果，以便后续可以根据不同resultType过滤）
 	if twoLevelCache != nil && config.AppConfig.CacheEnabled {
 		go func(resp model.SearchResponse) {
-			data, err := json.Marshal(resp)
+			data, err := cache.SerializeWithPool(resp)
 			if err != nil {
 				return
 			}

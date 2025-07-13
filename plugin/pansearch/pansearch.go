@@ -2,7 +2,6 @@ package pansearch
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -15,6 +14,7 @@ import (
 
 	"pansou/model"
 	"pansou/plugin"
+	"pansou/util/json"
 	"sync/atomic"
 )
 
@@ -41,7 +41,7 @@ const (
 	BaseURLTemplate = "https://www.pansearch.me/_next/data/%s/search.json"
 
 	// 默认参数
-	DefaultTimeout = 3 * time.Second // 减少默认超时时间
+	DefaultTimeout = 6 * time.Second // 减少默认超时时间
 	PageSize       = 10
 	MaxResults     = 1000
 	MaxConcurrent  = 200 // 增加最大并发数

@@ -1,7 +1,6 @@
 package pan666
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 
 	"pansou/model"
 	"pansou/plugin"
+	"pansou/util/json"
 	"sync"
 	"math/rand"
 	"sort"
