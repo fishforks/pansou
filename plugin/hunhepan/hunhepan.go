@@ -14,10 +14,38 @@ import (
 	"pansou/util/json"
 )
 
+// 缓存相关变量
+var (
+	// API响应缓存，键为"apiURL:keyword"，值为[]HunhepanItem
+	apiResponseCache = sync.Map{}
+	
+	// 最后一次清理缓存的时间
+	lastCacheCleanTime = time.Now()
+	
+	// 缓存有效期（1小时）
+	cacheTTL = 1 * time.Hour
+)
+
 // 在init函数中注册插件
 func init() {
 	// 使用全局超时时间创建插件实例并注册
 	plugin.RegisterGlobalPlugin(NewHunhepanPlugin())
+	
+	// 启动缓存清理goroutine
+	go startCacheCleaner()
+}
+
+// startCacheCleaner 启动一个定期清理缓存的goroutine
+func startCacheCleaner() {
+	// 每小时清理一次缓存
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		// 清空所有缓存
+		apiResponseCache = sync.Map{}
+		lastCacheCleanTime = time.Now()
+	}
 }
 
 const (
@@ -139,6 +167,18 @@ func (p *HunhepanPlugin) Search(keyword string) ([]model.SearchResult, error) {
 
 // searchAPI 向单个API发送请求
 func (p *HunhepanPlugin) searchAPI(apiURL, keyword string) ([]HunhepanItem, error) {
+	// 生成缓存键
+	cacheKey := fmt.Sprintf("%s:%s", apiURL, keyword)
+	
+	// 检查缓存中是否已有结果
+	if cachedItems, ok := apiResponseCache.Load(cacheKey); ok {
+		// 检查缓存是否过期
+		cachedResult := cachedItems.(cachedResponse)
+		if time.Since(cachedResult.timestamp) < cacheTTL {
+			return cachedResult.items, nil
+		}
+	}
+	
 	// 构建请求体
 	reqBody := map[string]interface{}{
 		"q":      keyword,
@@ -198,7 +238,19 @@ func (p *HunhepanPlugin) searchAPI(apiURL, keyword string) ([]HunhepanItem, erro
 		return nil, fmt.Errorf("API returned error: %s", apiResp.Msg)
 	}
 	
+	// 缓存结果
+	apiResponseCache.Store(cacheKey, cachedResponse{
+		items:     apiResp.Data.List,
+		timestamp: time.Now(),
+	})
+	
 	return apiResp.Data.List, nil
+}
+
+// 缓存响应结构
+type cachedResponse struct {
+	items     []HunhepanItem
+	timestamp time.Time
 }
 
 // deduplicateItems 去重处理

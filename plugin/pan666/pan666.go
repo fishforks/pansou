@@ -16,9 +16,37 @@ import (
 	"sort"
 )
 
+// 缓存相关变量
+var (
+	// API响应缓存，键为关键词，值为缓存的响应
+	apiResponseCache = sync.Map{}
+	
+	// 最后一次清理缓存的时间
+	lastCacheCleanTime = time.Now()
+	
+	// 缓存有效期（1小时）
+	cacheTTL = 1 * time.Hour
+)
+
 // 在init函数中注册插件
 func init() {
 	plugin.RegisterGlobalPlugin(NewPan666Plugin())
+	
+	// 启动缓存清理goroutine
+	go startCacheCleaner()
+}
+
+// startCacheCleaner 启动一个定期清理缓存的goroutine
+func startCacheCleaner() {
+	// 每小时清理一次缓存
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		// 清空所有缓存
+		apiResponseCache = sync.Map{}
+		lastCacheCleanTime = time.Now()
+	}
 }
 
 const (
@@ -85,8 +113,25 @@ func getRandomUA() string {
 	return userAgents[rand.Intn(len(userAgents))]
 }
 
+// 缓存响应结构
+type cachedResponse struct {
+	results   []model.SearchResult
+	timestamp time.Time
+}
+
 // Search 执行搜索并返回结果
 func (p *Pan666Plugin) Search(keyword string) ([]model.SearchResult, error) {
+	// 生成缓存键
+	cacheKey := keyword
+	
+	// 检查缓存中是否已有结果
+	if cachedItems, ok := apiResponseCache.Load(cacheKey); ok {
+		// 检查缓存是否过期
+		cachedResult := cachedItems.(cachedResponse)
+		if time.Since(cachedResult.timestamp) < cacheTTL {
+			return cachedResult.results, nil
+		}
+	}
 	
 	// 初始化随机数种子
 	rand.Seed(time.Now().UnixNano())
@@ -99,6 +144,12 @@ func (p *Pan666Plugin) Search(keyword string) ([]model.SearchResult, error) {
 	
 	// 去重
 	uniqueResults := p.deduplicateResults(allResults)
+	
+	// 缓存结果
+	apiResponseCache.Store(cacheKey, cachedResponse{
+		results:   uniqueResults,
+		timestamp: time.Now(),
+	})
 	
 	return uniqueResults, nil
 }
@@ -198,16 +249,16 @@ func (p *Pan666Plugin) fetchBatch(keyword string, startOffset, pageCount int) ([
 		}
 	}
 	
-	// 检查是否需要继续请求
-	needMoreRequests := false
-	for _, hasMore := range hasMoreByOffset {
-		if hasMore {
-			needMoreRequests = true
+	// 判断是否还有更多页面
+	hasMore := false
+	for _, more := range hasMoreByOffset {
+		if more {
+			hasMore = true
 			break
 		}
 	}
 	
-	return allResults, needMoreRequests, nil
+	return allResults, hasMore, nil
 }
 
 // deduplicateResults 去除重复的搜索结果

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"pansou/model"
@@ -13,10 +14,38 @@ import (
 	"pansou/util/json"
 )
 
+// 缓存相关变量
+var (
+	// API响应缓存，键为关键词，值为缓存的响应
+	apiResponseCache = sync.Map{}
+	
+	// 最后一次清理缓存的时间
+	lastCacheCleanTime = time.Now()
+	
+	// 缓存有效期（1小时）
+	cacheTTL = 1 * time.Hour
+)
+
 // 在init函数中注册插件
 func init() {
 	// 使用全局超时时间创建插件实例并注册
 	plugin.RegisterGlobalPlugin(NewQuPanSouPlugin())
+	
+	// 启动缓存清理goroutine
+	go startCacheCleaner()
+}
+
+// startCacheCleaner 启动一个定期清理缓存的goroutine
+func startCacheCleaner() {
+	// 每小时清理一次缓存
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		// 清空所有缓存
+		apiResponseCache = sync.Map{}
+		lastCacheCleanTime = time.Now()
+	}
 }
 
 const (
@@ -60,6 +89,18 @@ func (p *QuPanSouPlugin) Priority() int {
 
 // Search 执行搜索并返回结果
 func (p *QuPanSouPlugin) Search(keyword string) ([]model.SearchResult, error) {
+	// 生成缓存键
+	cacheKey := keyword
+	
+	// 检查缓存中是否已有结果
+	if cachedItems, ok := apiResponseCache.Load(cacheKey); ok {
+		// 检查缓存是否过期
+		cachedResult := cachedItems.(cachedResponse)
+		if time.Since(cachedResult.timestamp) < cacheTTL {
+			return cachedResult.results, nil
+		}
+	}
+	
 	// 发送API请求
 	items, err := p.searchAPI(keyword)
 	if err != nil {
@@ -69,7 +110,19 @@ func (p *QuPanSouPlugin) Search(keyword string) ([]model.SearchResult, error) {
 	// 转换为标准格式
 	results := p.convertResults(items)
 	
+	// 缓存结果
+	apiResponseCache.Store(cacheKey, cachedResponse{
+		results:   results,
+		timestamp: time.Now(),
+	})
+	
 	return results, nil
+}
+
+// 缓存响应结构
+type cachedResponse struct {
+	results   []model.SearchResult
+	timestamp time.Time
 }
 
 // searchAPI 向API发送请求
@@ -198,33 +251,36 @@ func (p *QuPanSouPlugin) convertResults(items []QuPanSouItem) []model.SearchResu
 func (p *QuPanSouPlugin) determineLinkType(url string) string {
 	lowerURL := strings.ToLower(url)
 	
-	switch {
-	case strings.Contains(lowerURL, "pan.baidu.com"):
+	if strings.Contains(lowerURL, "pan.baidu.com") {
 		return "baidu"
-	case strings.Contains(lowerURL, "pan.quark.cn"):
-		return "quark"
-	case strings.Contains(lowerURL, "alipan.com") || strings.Contains(lowerURL, "aliyundrive.com"):
+	} else if strings.Contains(lowerURL, "aliyundrive.com") || strings.Contains(lowerURL, "alipan.com") {
 		return "aliyun"
-	case strings.Contains(lowerURL, "cloud.189.cn"):
+	} else if strings.Contains(lowerURL, "pan.quark.cn") {
+		return "quark"
+	} else if strings.Contains(lowerURL, "cloud.189.cn") {
 		return "tianyi"
-	case strings.Contains(lowerURL, "caiyun.139.com"):
-		return "mobile"
-	case strings.Contains(lowerURL, "115.com"):
-		return "115"
-	case strings.Contains(lowerURL, "pan.xunlei.com"):
+	} else if strings.Contains(lowerURL, "pan.xunlei.com") {
 		return "xunlei"
-	case strings.Contains(lowerURL, "mypikpak.com"):
-		return "pikpak"
-	case strings.Contains(lowerURL, "123"):
+	} else if strings.Contains(lowerURL, "caiyun.139.com") || strings.Contains(lowerURL, "www.caiyun.139.com") {
+		return "mobile"
+	} else if strings.Contains(lowerURL, "115.com") {
+		return "115"
+	} else if strings.Contains(lowerURL, "drive.uc.cn") {
+		return "uc"
+	} else if strings.Contains(lowerURL, "pan.123.com") || strings.Contains(lowerURL, "123pan.com") {
 		return "123"
-	default:
+	} else if strings.Contains(lowerURL, "mypikpak.com") {
+		return "pikpak"
+	} else if strings.Contains(lowerURL, "lanzou") {
+		return "lanzou"
+	} else {
 		return "others"
 	}
 }
 
 // cleanHTML 清理HTML标签
 func cleanHTML(html string) string {
-	// 替换常见HTML标签
+	// 一次性替换所有常见HTML标签
 	replacements := map[string]string{
 		"<em>": "",
 		"</em>": "",
@@ -232,6 +288,8 @@ func cleanHTML(html string) string {
 		"</b>": "",
 		"<strong>": "",
 		"</strong>": "",
+		"<i>": "",
+		"</i>": "",
 	}
 	
 	result := html
@@ -239,6 +297,7 @@ func cleanHTML(html string) string {
 		result = strings.Replace(result, tag, replacement, -1)
 	}
 	
+	// 移除多余的空格
 	return strings.TrimSpace(result)
 }
 

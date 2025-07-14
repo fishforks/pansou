@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"pansou/model"
@@ -13,10 +14,38 @@ import (
 	"pansou/util/json"
 )
 
+// 缓存相关变量
+var (
+	// API响应缓存，键为关键词，值为缓存的响应
+	apiResponseCache = sync.Map{}
+	
+	// 最后一次清理缓存的时间
+	lastCacheCleanTime = time.Now()
+	
+	// 缓存有效期（1小时）
+	cacheTTL = 1 * time.Hour
+)
+
 // 在init函数中注册插件
 func init() {
 	// 使用全局超时时间创建插件实例并注册
 	plugin.RegisterGlobalPlugin(NewJikepanPlugin())
+	
+	// 启动缓存清理goroutine
+	go startCacheCleaner()
+}
+
+// startCacheCleaner 启动一个定期清理缓存的goroutine
+func startCacheCleaner() {
+	// 每小时清理一次缓存
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		// 清空所有缓存
+		apiResponseCache = sync.Map{}
+		lastCacheCleanTime = time.Now()
+	}
 }
 
 const (
@@ -56,6 +85,18 @@ func (p *JikepanPlugin) Priority() int {
 
 // Search 执行搜索并返回结果
 func (p *JikepanPlugin) Search(keyword string) ([]model.SearchResult, error) {
+	// 生成缓存键
+	cacheKey := keyword
+	
+	// 检查缓存中是否已有结果
+	if cachedItems, ok := apiResponseCache.Load(cacheKey); ok {
+		// 检查缓存是否过期
+		cachedResult := cachedItems.(cachedResponse)
+		if time.Since(cachedResult.timestamp) < cacheTTL {
+			return cachedResult.results, nil
+		}
+	}
+	
 	// 构建请求
 	reqBody := map[string]interface{}{
 		"name":   keyword,
@@ -100,7 +141,21 @@ func (p *JikepanPlugin) Search(keyword string) ([]model.SearchResult, error) {
 	}
 	
 	// 转换结果格式
-	return p.convertResults(apiResp.List), nil
+	results := p.convertResults(apiResp.List)
+	
+	// 缓存结果
+	apiResponseCache.Store(cacheKey, cachedResponse{
+		results:   results,
+		timestamp: time.Now(),
+	})
+	
+	return results, nil
+}
+
+// 缓存响应结构
+type cachedResponse struct {
+	results   []model.SearchResult
+	timestamp time.Time
 }
 
 // convertResults 将API响应转换为标准SearchResult格式
@@ -198,7 +253,7 @@ func (p *JikepanPlugin) convertLinkType(service string) string {
 
 // JikepanResponse API响应结构
 type JikepanResponse struct {
-	Msg  string       `json:"msg"`
+	Msg  string        `json:"msg"`
 	List []JikepanItem `json:"list"`
 }
 
@@ -208,7 +263,7 @@ type JikepanItem struct {
 	Links []JikepanLink `json:"links"`
 }
 
-// JikepanLink API响应中的链接
+// JikepanLink API响应中的链接信息
 type JikepanLink struct {
 	Service string `json:"service"`
 	Link    string `json:"link"`
