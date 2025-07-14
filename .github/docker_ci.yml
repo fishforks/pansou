@@ -18,7 +18,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -67,4 +66,4 @@ jobs:
           build-args: |
             BUILD_DATE=${{ github.event.repository.updated_at }}
             VCS_REF=${{ github.sha }}
-            VERSION=${{ steps.meta.outputs.version }} 
+            VERSION=${{ steps.meta.outputs.version }}
