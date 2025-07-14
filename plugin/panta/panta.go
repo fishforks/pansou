@@ -118,7 +118,7 @@ const (
 	defaultPriority = 2
 	
 	// 默认超时时间（秒）
-	defaultTimeout = 10
+	defaultTimeout = 6
 	
 	// 默认并发数
 	defaultConcurrency = 30

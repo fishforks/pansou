@@ -1,20 +1,26 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"pansou/api"
 	"pansou/config"
 	"pansou/plugin"
 	// 以下是插件的空导入，用于触发各插件的init函数，实现自动注册
 	// 添加新插件时，只需在此处添加对应的导入语句即可
+	_ "pansou/plugin/hunhepan"
 	_ "pansou/plugin/jikepan"
-	_ "pansou/plugin/hunhepan" 
-	_ "pansou/plugin/pansearch"
-	_ "pansou/plugin/qupansou"
 	_ "pansou/plugin/pan666"
-	_ "pansou/plugin/panta"  // 添加PanTa网站插件
+	_ "pansou/plugin/pansearch"
+	_ "pansou/plugin/panta"
+	_ "pansou/plugin/qupansou"
 	"pansou/service"
 	"pansou/util"
 )
@@ -34,6 +40,9 @@ func initApp() {
 	
 	// 初始化HTTP客户端
 	util.InitHTTPClient()
+	
+	// 确保异步插件系统初始化
+	plugin.InitAsyncPluginSystem()
 }
 
 // startServer 启动Web服务器
@@ -56,10 +65,40 @@ func startServer() {
 	// 输出服务信息
 	printServiceInfo(port, pluginManager)
 	
-	// 启动Web服务器
-	if err := router.Run(":" + port); err != nil {
-		log.Fatalf("启动服务器失败: %v", err)
+	// 创建HTTP服务器
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: router,
 	}
+	
+	// 创建通道来接收操作系统信号
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	
+	// 在单独的goroutine中启动服务器
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("启动服务器失败: %v", err)
+		}
+	}()
+	
+	// 等待中断信号
+	<-quit
+	fmt.Println("正在关闭服务器...")
+	
+	// 设置关闭超时时间
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	// 保存异步插件缓存
+	plugin.SaveCacheToDisk()
+	
+	// 优雅关闭服务器
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatalf("服务器关闭异常: %v", err)
+	}
+	
+	fmt.Println("服务器已安全关闭")
 }
 
 // printServiceInfo 打印服务信息
@@ -96,6 +135,17 @@ func printServiceInfo(port string, pluginManager *plugin.PluginManager) {
 	fmt.Printf("GC配置: 触发阈值=%d%%, 内存优化=%v\n", 
 		config.AppConfig.GCPercent, 
 		config.AppConfig.OptimizeMemory)
+	
+	// 输出异步插件配置信息
+	if config.AppConfig.AsyncPluginEnabled {
+		fmt.Printf("异步插件已启用: 响应超时=%d秒, 最大工作者=%d, 最大任务=%d, 缓存TTL=%d小时\n",
+			config.AppConfig.AsyncResponseTimeout,
+			config.AppConfig.AsyncMaxBackgroundWorkers,
+			config.AppConfig.AsyncMaxBackgroundTasks,
+			config.AppConfig.AsyncCacheTTLHours)
+	} else {
+		fmt.Println("异步插件已禁用")
+	}
 	
 	// 输出插件信息
 	fmt.Println("已加载插件:")

@@ -71,17 +71,23 @@ func SearchHandler(c *gin.Context) {
 		}
 		
 		// 处理plugins参数，支持逗号分隔
-		pluginsStr := c.Query("plugins")
 		var plugins []string
-		// 只有当参数非空时才处理
-		if pluginsStr != "" && pluginsStr != " " {
-			parts := strings.Split(pluginsStr, ",")
-			for _, part := range parts {
-				trimmed := strings.TrimSpace(part)
-				if trimmed != "" {
-					plugins = append(plugins, trimmed)
+		// 检查请求中是否存在plugins参数
+		if c.Request.URL.Query().Has("plugins") {
+			pluginsStr := c.Query("plugins")
+			// 判断参数是否非空
+			if pluginsStr != "" && pluginsStr != " " {
+				parts := strings.Split(pluginsStr, ",")
+				for _, part := range parts {
+					trimmed := strings.TrimSpace(part)
+					if trimmed != "" {
+						plugins = append(plugins, trimmed)
+					}
 				}
 			}
+		} else {
+			// 如果请求中不存在plugins参数，设置为nil
+			plugins = nil
 		}
 
 		req = model.SearchRequest{
@@ -130,6 +136,11 @@ func SearchHandler(c *gin.Context) {
 		req.Plugins = nil // 忽略plugins参数
 	} else if req.SourceType == "plugin" {
 		req.Channels = nil // 忽略channels参数
+	} else if req.SourceType == "all" {
+		// 对于all类型，如果plugins为空或不存在，统一设为nil
+		if req.Plugins == nil || len(req.Plugins) == 0 {
+			req.Plugins = nil
+		}
 	}
 	
 	// 执行搜索

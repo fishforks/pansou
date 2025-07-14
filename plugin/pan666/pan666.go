@@ -1,24 +1,25 @@
 package pan666
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"pansou/model"
 	"pansou/plugin"
-	"sync"
-	"math/rand"
-	"sort"
+	"pansou/util/json"
 )
 
 // 在init函数中注册插件
 func init() {
-	plugin.RegisterGlobalPlugin(NewPan666Plugin())
+	// 注册插件
+	plugin.RegisterGlobalPlugin(NewPan666AsyncPlugin())
 }
 
 const (
@@ -26,8 +27,7 @@ const (
 	BaseURL = "https://pan666.net/api/discussions"
 	
 	// 默认参数
-	DefaultTimeout = 6 * time.Second
-	PageSize = 50 // 恢复为50，符合API实际返回数量
+	PageSize = 50 // 符合API实际返回数量
 	MaxRetries = 2
 )
 
@@ -41,58 +41,36 @@ var userAgents = []string{
 	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36",
 }
 
-// Pan666Plugin pan666网盘搜索插件
-type Pan666Plugin struct {
-	client    *http.Client
-	timeout   time.Duration
-	retries    int
+// Pan666AsyncPlugin pan666网盘搜索异步插件
+type Pan666AsyncPlugin struct {
+	*plugin.BaseAsyncPlugin
+	retries int
 }
 
-// NewPan666Plugin 创建新的pan666插件
-func NewPan666Plugin() *Pan666Plugin {
-	timeout := DefaultTimeout
-	
-	return &Pan666Plugin{
-		client: &http.Client{
-			Timeout: timeout,
-		},
-		timeout:    timeout,
-		retries:    MaxRetries,
+// NewPan666AsyncPlugin 创建新的pan666异步插件
+func NewPan666AsyncPlugin() *Pan666AsyncPlugin {
+	return &Pan666AsyncPlugin{
+		BaseAsyncPlugin: plugin.NewBaseAsyncPlugin("pan666", 3),
+		retries:         MaxRetries,
 	}
 }
 
-// Name 返回插件名称
-func (p *Pan666Plugin) Name() string {
-	return "pan666"
-}
-
-// Priority 返回插件优先级
-func (p *Pan666Plugin) Priority() int {
-	return 3 // 中等优先级
-}
-
-// 生成随机IP
-func generateRandomIP() string {
-	return fmt.Sprintf("%d.%d.%d.%d", 
-		rand.Intn(223)+1,  // 避免0和255
-		rand.Intn(255),
-		rand.Intn(255),
-		rand.Intn(254)+1)  // 避免0
-}
-
-// 获取随机UA
-func getRandomUA() string {
-	return userAgents[rand.Intn(len(userAgents))]
-}
-
 // Search 执行搜索并返回结果
-func (p *Pan666Plugin) Search(keyword string) ([]model.SearchResult, error) {
+func (p *Pan666AsyncPlugin) Search(keyword string) ([]model.SearchResult, error) {
+	// 生成缓存键
+	cacheKey := keyword
 	
+	// 使用异步搜索基础方法
+	return p.AsyncSearch(keyword, cacheKey, p.doSearch)
+}
+
+// doSearch 实际的搜索实现
+func (p *Pan666AsyncPlugin) doSearch(client *http.Client, keyword string) ([]model.SearchResult, error) {
 	// 初始化随机数种子
 	rand.Seed(time.Now().UnixNano())
 	
 	// 只并发请求2个页面（0-1页）
-	allResults, _, err := p.fetchBatch(keyword, 0, 2)
+	allResults, _, err := p.fetchBatch(client, keyword, 0, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +82,7 @@ func (p *Pan666Plugin) Search(keyword string) ([]model.SearchResult, error) {
 }
 
 // fetchBatch 获取一批页面的数据
-func (p *Pan666Plugin) fetchBatch(keyword string, startOffset, pageCount int) ([]model.SearchResult, bool, error) {
+func (p *Pan666AsyncPlugin) fetchBatch(client *http.Client, keyword string, startOffset, pageCount int) ([]model.SearchResult, bool, error) {
 	var wg sync.WaitGroup
 	resultChan := make(chan struct{
 		offset  int
@@ -129,7 +107,7 @@ func (p *Pan666Plugin) fetchBatch(keyword string, startOffset, pageCount int) ([
 			}
 			
 			// 请求特定页面
-			results, hasMore, err := p.fetchPage(keyword, offset)
+			results, hasMore, err := p.fetchPage(client, keyword, offset)
 			
 			resultChan <- struct{
 				offset  int
@@ -153,370 +131,559 @@ func (p *Pan666Plugin) fetchBatch(keyword string, startOffset, pageCount int) ([
 	
 	// 收集结果
 	var allResults []model.SearchResult
-	resultsByOffset := make(map[int][]model.SearchResult)
-	errorsByOffset := make(map[int]error)
-	hasMoreByOffset := make(map[int]bool)
+	hasMore := false
 	
-	// 处理返回的结果
-	for res := range resultChan {
-		if res.err != nil {
-			errorsByOffset[res.offset] = res.err
-			continue
+	for result := range resultChan {
+		if result.err != nil {
+			return nil, false, result.err
 		}
 		
-		resultsByOffset[res.offset] = res.results
-		hasMoreByOffset[res.offset] = res.hasMore
+		allResults = append(allResults, result.results...)
+		hasMore = hasMore || result.hasMore
 	}
 	
-	// 按偏移量顺序整理结果
-	emptyPageCount := 0
-	for i := 0; i < pageCount; i++ {
-		offset := (startOffset + i) * PageSize
-		results, ok := resultsByOffset[offset]
-		
-		if !ok {
-			// 这个偏移量的请求失败了
-			continue
-		}
-		
-		if len(results) == 0 {
-			emptyPageCount++
-			// 如果连续两页没有结果，可能已经到达末尾，可以提前终止
-			if emptyPageCount >= 2 {
-				break
-			}
-		} else {
-			emptyPageCount = 0 // 重置空页计数
-			allResults = append(allResults, results...)
-		}
-	}
-	
-	// 检查是否所有请求都失败
-	if len(errorsByOffset) == pageCount {
-		for _, err := range errorsByOffset {
-			return nil, false, fmt.Errorf("所有请求都失败: %w", err)
-		}
-	}
-	
-	// 检查是否需要继续请求
-	needMoreRequests := false
-	for _, hasMore := range hasMoreByOffset {
-		if hasMore {
-			needMoreRequests = true
-			break
-		}
-	}
-	
-	return allResults, needMoreRequests, nil
+	return allResults, hasMore, nil
 }
 
-// deduplicateResults 去除重复的搜索结果
-func (p *Pan666Plugin) deduplicateResults(results []model.SearchResult) []model.SearchResult {
+// deduplicateResults 去除重复结果
+func (p *Pan666AsyncPlugin) deduplicateResults(results []model.SearchResult) []model.SearchResult {
 	seen := make(map[string]bool)
-	var uniqueResults []model.SearchResult
+	unique := make([]model.SearchResult, 0, len(results))
 	
 	for _, result := range results {
 		if !seen[result.UniqueID] {
 			seen[result.UniqueID] = true
-			uniqueResults = append(uniqueResults, result)
+			unique = append(unique, result)
 		}
 	}
 	
-	return uniqueResults
+	// 按时间降序排序
+	sort.Slice(unique, func(i, j int) bool {
+		return unique[i].Datetime.After(unique[j].Datetime)
+	})
+	
+	return unique
 }
 
-// fetchPage 获取指定偏移量的页面数据
-func (p *Pan666Plugin) fetchPage(keyword string, offset int) ([]model.SearchResult, bool, error) {
-	// 构建请求URL，包含查询参数
-	reqURL := fmt.Sprintf("%s?filter%%5Bq%%5D=%s&page%%5Blimit%%5D=%d", 
-		BaseURL, url.QueryEscape(keyword), PageSize)
+// fetchPage 获取指定页的搜索结果
+func (p *Pan666AsyncPlugin) fetchPage(client *http.Client, keyword string, offset int) ([]model.SearchResult, bool, error) {
+	// 构建API URL
+	apiURL := fmt.Sprintf("%s?filter[q]=%s&include=mostRelevantPost&page[offset]=%d&page[limit]=%d",
+		BaseURL, url.QueryEscape(keyword), offset, PageSize)
 	
-	// 添加偏移量参数
-	if offset > 0 {
-		reqURL += fmt.Sprintf("&page%%5Boffset%%5D=%d", offset)
-	}
-	
-	// 添加包含mostRelevantPost参数
-	reqURL += "&include=mostRelevantPost"
-	
-	// 发送请求
-	req, err := http.NewRequest("GET", reqURL, nil)
+	// 创建请求
+	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return nil, false, fmt.Errorf("创建请求失败: %w", err)
 	}
 	
-	// 使用随机UA和IP
-	randomUA := getRandomUA()
-	randomIP := generateRandomIP()
-	
-	req.Header.Set("User-Agent", randomUA)
-	req.Header.Set("Referer", "https://pan666.net/")
-	req.Header.Set("X-Forwarded-For", randomIP)
-	req.Header.Set("X-Real-IP", randomIP)
-	
-	// 添加一些常见请求头，使请求更真实
+	// 设置请求头
+	req.Header.Set("User-Agent", getRandomUA())
+	req.Header.Set("X-Forwarded-For", generateRandomIP())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
 	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	
-	// 发送请求
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, false, fmt.Errorf("请求失败: %w", err)
-	}
-	defer resp.Body.Close()
+	var resp *http.Response
+	var responseBody []byte
 	
-	// 读取响应体
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, false, fmt.Errorf("读取响应失败: %w", err)
+	// 重试逻辑
+	for i := 0; i <= p.retries; i++ {
+		// 发送请求
+		resp, err = client.Do(req)
+		if err != nil {
+			if i == p.retries {
+				return nil, false, fmt.Errorf("请求失败: %w", err)
+			}
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		
+		defer resp.Body.Close()
+		
+		// 读取响应体
+		responseBody, err = io.ReadAll(resp.Body)
+		if err != nil {
+			if i == p.retries {
+				return nil, false, fmt.Errorf("读取响应失败: %w", err)
+			}
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		
+		// 状态码检查
+		if resp.StatusCode != http.StatusOK {
+			if i == p.retries {
+				return nil, false, fmt.Errorf("API返回非200状态码: %d", resp.StatusCode)
+			}
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		
+		// 请求成功，跳出重试循环
+		break
 	}
 	
 	// 解析响应
 	var apiResp Pan666Response
-	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+	if err := json.Unmarshal(responseBody, &apiResp); err != nil {
 		return nil, false, fmt.Errorf("解析响应失败: %w", err)
 	}
 	
-	// 如果没有数据，返回空结果
-	if len(apiResp.Data) == 0 {
-		return []model.SearchResult{}, false, nil
-	}
-	
-	// 判断是否有更多页面
-	hasMore := len(apiResp.Data) >= PageSize && apiResp.Links.Next != ""
-	
-	// 构建ID到included post的映射
-	postMap := make(map[string]Pan666Post)
-	for _, post := range apiResp.Included {
-		if post.Type == "posts" {
-			postMap[post.ID] = post
-		}
-	}
-	
-	// 处理搜索结果
+	// 处理结果
 	results := make([]model.SearchResult, 0, len(apiResp.Data))
+	postMap := make(map[string]Pan666Post)
 	
-	for _, item := range apiResp.Data {
-		// 获取关联的post内容
-		postID := item.Relationships.MostRelevantPost.Data.ID
-		post, exists := postMap[postID]
+	// 创建帖子ID到帖子内容的映射
+	for _, post := range apiResp.Included {
+		postMap[post.ID] = post
+	}
+	
+	// 遍历搜索结果
+	for _, discussion := range apiResp.Data {
+		// 获取相关帖子
+		postID := discussion.Relationships.MostRelevantPost.Data.ID
+		post, ok := postMap[postID]
+		if !ok {
+			continue
+		}
 		
-		if !exists {
-			continue // 跳过没有关联内容的结果
+		// 清理HTML内容
+		cleanedHTML := cleanHTML(post.Attributes.ContentHTML)
+		
+		// 提取链接
+		links := extractLinksFromText(cleanedHTML)
+		if len(links) == 0 {
+			links = extractLinks(cleanedHTML)
+		}
+		
+		// 如果没有找到链接，跳过该结果
+		if len(links) == 0 {
+			continue
 		}
 		
 		// 解析时间
-		createdAt, _ := time.Parse(time.RFC3339, item.Attributes.CreatedAt)
-		
-		// 先清理HTML，保留纯文本内容
-		cleanContent := cleanHTML(post.Attributes.ContentHTML)
-		
-		// 提取网盘链接
-		links := extractLinksFromText(cleanContent)
-		
-		// 只有当links数组不为空时，才添加结果
-		if len(links) > 0 {
-			// 创建搜索结果
-			result := model.SearchResult{
-				MessageID: item.ID,
-				UniqueID:  fmt.Sprintf("pan666_%s", item.ID),
-				Channel:   "", // 设置为空字符串，因为不是TG频道
-				Datetime:  createdAt,
-				Title:     item.Attributes.Title,
-				Content:   cleanContent,
-				Links:     links,
-			}
-			
-			results = append(results, result)
+		createdTime, err := time.Parse(time.RFC3339, discussion.Attributes.CreatedAt)
+		if err != nil {
+			createdTime = time.Now() // 如果解析失败，使用当前时间
 		}
+		
+		// 创建唯一ID：插件名-帖子ID
+		uniqueID := fmt.Sprintf("pan666-%s", discussion.ID)
+		
+		// 创建搜索结果
+		result := model.SearchResult{
+			UniqueID:  uniqueID,
+			Title:     discussion.Attributes.Title,
+			Datetime:  createdTime,
+			Links:     links,
+		}
+		
+		results = append(results, result)
 	}
+	
+	// 判断是否有更多结果
+	hasMore := apiResp.Links.Next != ""
 	
 	return results, hasMore, nil
 }
 
-// extractLinks 从HTML内容中提取网盘链接
-func extractLinks(content string) []model.Link {
-	links := make([]model.Link, 0)
-	
-	// 定义网盘类型及其对应的链接关键词
-	categories := map[string][]string{
-		"magnet":  {"magnet"},                                                                  // 磁力链接
-		"ed2k":    {"ed2k"},                                                                    // 电驴链接
-		"uc":      {"drive.uc.cn"},                                                             // UC网盘
-		"mobile":  {"caiyun.139.com"},                                                          // 移动云盘
-		"tianyi":  {"cloud.189.cn"},                                                            // 天翼云盘
-		"quark":   {"pan.quark.cn"},                                                            // 夸克网盘
-		"115":     {"115cdn.com", "115.com", "anxia.com"},                                      // 115网盘
-		"aliyun":  {"alipan.com", "aliyundrive.com"},                                           // 阿里云盘
-		"pikpak":  {"mypikpak.com"},                                                            // PikPak网盘
-		"baidu":   {"pan.baidu.com"},                                                           // 百度网盘
-		"123":     {"123684.com", "123685.com", "123912.com", "123pan.com", "123pan.cn", "123592.com"}, // 123网盘
-		"lanzou":  {"lanzou", "lanzoux"},                                                       // 蓝奏云
-		"xunlei":  {"pan.xunlei.com"},                                                          // 迅雷网盘
-		"weiyun":  {"weiyun.com"},                                                              // 微云
-		"jianguoyun": {"jianguoyun.com"},                                                       // 坚果云
-	}
-	
-	// 遍历所有分类，提取对应的链接
-	for category, patterns := range categories {
-		for _, pattern := range patterns {
-			categoryLinks := extractLinksByPattern(content, pattern, "", category)
-			links = append(links, categoryLinks...)
-		}
-	}
-	
-	return links
+// 生成随机IP
+func generateRandomIP() string {
+	return fmt.Sprintf("%d.%d.%d.%d", 
+		rand.Intn(223)+1,  // 避免0和255
+		rand.Intn(255),
+		rand.Intn(255),
+		rand.Intn(254)+1)  // 避免0
 }
 
-// extractLinksByPattern 根据特定模式提取链接
-func extractLinksByPattern(content, pattern, altPattern, linkType string) []model.Link {
-	links := make([]model.Link, 0)
+// 获取随机UA
+func getRandomUA() string {
+	return userAgents[rand.Intn(len(userAgents))]
+}
+
+// 从文本提取链接
+func extractLinks(content string) []model.Link {
+	var allLinks []model.Link
 	
-	// 查找所有包含pattern的行
+	// 提取百度网盘链接
+	baiduLinks := extractLinksByPattern(content, "链接: https://pan.baidu.com", "提取码:", "baidu")
+	allLinks = append(allLinks, baiduLinks...)
+	
+	// 提取蓝奏云链接
+	lanzouLinks := extractLinksByPattern(content, "https://[a-zA-Z0-9-]+.lanzou", "密码:", "lanzou")
+	allLinks = append(allLinks, lanzouLinks...)
+	
+	// 提取阿里云盘链接
+	aliyunLinks := extractLinksByPattern(content, "https://www.aliyundrive.com/s/", "提取码:", "aliyun")
+	allLinks = append(allLinks, aliyunLinks...)
+	
+	// 提取天翼云盘链接
+	tianyiLinks := extractLinksByPattern(content, "https://cloud.189.cn", "访问码:", "tianyi")
+	allLinks = append(allLinks, tianyiLinks...)
+	
+	return allLinks
+}
+
+// 根据模式提取链接
+func extractLinksByPattern(content, pattern, altPattern, linkType string) []model.Link {
+	var links []model.Link
+	
 	lines := strings.Split(content, "\n")
-	for _, line := range lines {
-		// 提取主要pattern的链接
-		if idx := strings.Index(line, pattern); idx != -1 {
-			link := extractLinkFromLine(line[idx:], pattern)
-			if link.URL != "" {
-				link.Type = linkType
-				links = append(links, link)
-			}
-		}
-		
-		// 如果有替代pattern，也提取
-		if altPattern != "" {
-			if idx := strings.Index(line, altPattern); idx != -1 {
-				link := extractLinkFromLine(line[idx:], altPattern)
-				if link.URL != "" {
-					link.Type = linkType
-					links = append(links, link)
+	for i, line := range lines {
+		if strings.Contains(line, pattern) {
+			link := extractLinkFromLine(line, pattern)
+			
+			// 如果在当前行找不到密码，尝试在下一行查找
+			if link.Password == "" && i+1 < len(lines) && strings.Contains(lines[i+1], altPattern) {
+				passwordLine := lines[i+1]
+				start := strings.Index(passwordLine, altPattern) + len(altPattern)
+				if start < len(passwordLine) {
+					end := len(passwordLine)
+					// 提取密码（移除前后空格）
+					password := strings.TrimSpace(passwordLine[start:end])
+					link.Password = password
 				}
 			}
+			
+			link.Type = linkType
+			links = append(links, link)
 		}
 	}
 	
 	return links
 }
 
-// extractLinkFromLine 从行中提取链接和密码
+// 从行中提取链接
 func extractLinkFromLine(line, prefix string) model.Link {
-	link := model.Link{}
+	var link model.Link
+	
+	start := strings.Index(line, prefix)
+	if start < 0 {
+		return link
+	}
+	
+	// 查找URL的结束位置
+	end := len(line)
+	possibleEnds := []string{" ", "提取码", "密码", "访问码"}
+	for _, endStr := range possibleEnds {
+		pos := strings.Index(line[start:], endStr)
+		if pos > 0 && start+pos < end {
+			end = start + pos
+		}
+	}
 	
 	// 提取URL
-	endIdx := strings.Index(line, "\"")
-	if endIdx == -1 {
-		endIdx = strings.Index(line, "'")
-	}
-	if endIdx == -1 {
-		endIdx = strings.Index(line, " ")
-	}
-	if endIdx == -1 {
-		endIdx = strings.Index(line, "<")
-	}
-	if endIdx == -1 {
-		endIdx = len(line)
-	}
-	
-	url := line[:endIdx]
+	url := strings.TrimSpace(line[start:end])
 	link.URL = url
 	
-	// 查找密码
-	pwdKeywords := []string{"提取码", "密码", "提取密码", "pwd", "password", "提取"}
-	for _, keyword := range pwdKeywords {
-		if pwdIdx := strings.Index(strings.ToLower(line), strings.ToLower(keyword)); pwdIdx != -1 {
-			// 密码通常在关键词后面
-			restOfLine := line[pwdIdx+len(keyword):]
-			
-			// 跳过可能的分隔符
-			restOfLine = strings.TrimLeft(restOfLine, " :：=")
-			
-			// 提取密码（通常是4个字符）
-			if len(restOfLine) >= 4 {
-				// 获取前4个字符作为密码
-				password := strings.TrimSpace(restOfLine[:4])
-				// 确保密码不包含HTML标签或其他非法字符
-				if !strings.ContainsAny(password, "<>\"'") {
-					link.Password = password
-					break
-				}
-			}
+	// 尝试从同一行提取密码
+	passwordKeywords := []string{"提取码:", "密码:", "访问码:"}
+	for _, keyword := range passwordKeywords {
+		passwordStart := strings.Index(line, keyword)
+		if passwordStart >= 0 {
+			passwordStart += len(keyword)
+			passwordEnd := len(line)
+			password := strings.TrimSpace(line[passwordStart:passwordEnd])
+			link.Password = password
+			break
 		}
+	}
+	
+	// 尝试从URL中提取密码
+	if link.Password == "" {
+		link.Password = extractPasswordFromURL(url)
 	}
 	
 	return link
 }
 
-// cleanHTML 清理HTML标签，保留纯文本内容
+// 清理HTML内容
 func cleanHTML(html string) string {
-	// 移除HTML标签
-	text := html
-	
-	// 移除<script>标签及其内容
-	for {
-		startIdx := strings.Index(text, "<script")
-		if startIdx == -1 {
-			break
-		}
-		
-		endIdx := strings.Index(text[startIdx:], "</script>")
-		if endIdx == -1 {
-			break
-		}
-		
-		text = text[:startIdx] + text[startIdx+endIdx+9:]
-	}
-	
-	// 移除<style>标签及其内容
-	for {
-		startIdx := strings.Index(text, "<style")
-		if startIdx == -1 {
-			break
-		}
-		
-		endIdx := strings.Index(text[startIdx:], "</style>")
-		if endIdx == -1 {
-			break
-		}
-		
-		text = text[:startIdx] + text[startIdx+endIdx+8:]
-	}
+	// 移除<br>标签
+	html = strings.ReplaceAll(html, "<br>", "\n")
+	html = strings.ReplaceAll(html, "<br/>", "\n")
+	html = strings.ReplaceAll(html, "<br />", "\n")
 	
 	// 移除其他HTML标签
-	for {
-		startIdx := strings.Index(text, "<")
-		if startIdx == -1 {
-			break
+	var result strings.Builder
+	inTag := false
+	
+	for _, r := range html {
+		if r == '<' {
+			inTag = true
+			continue
 		}
-		
-		endIdx := strings.Index(text[startIdx:], ">")
-		if endIdx == -1 {
-			break
+		if r == '>' {
+			inTag = false
+			continue
 		}
-		
-		text = text[:startIdx] + " " + text[startIdx+endIdx+1:]
+		if !inTag {
+			result.WriteRune(r)
+		}
 	}
 	
-	// 替换HTML实体
-	text = strings.ReplaceAll(text, "&nbsp;", " ")
-	text = strings.ReplaceAll(text, "&lt;", "<")
-	text = strings.ReplaceAll(text, "&gt;", ">")
-	text = strings.ReplaceAll(text, "&amp;", "&")
-	text = strings.ReplaceAll(text, "&quot;", "\"")
+	// 处理HTML实体
+	output := result.String()
+	output = strings.ReplaceAll(output, "&amp;", "&")
+	output = strings.ReplaceAll(output, "&lt;", "<")
+	output = strings.ReplaceAll(output, "&gt;", ">")
+	output = strings.ReplaceAll(output, "&quot;", "\"")
+	output = strings.ReplaceAll(output, "&apos;", "'")
+	output = strings.ReplaceAll(output, "&#39;", "'")
+	output = strings.ReplaceAll(output, "&nbsp;", " ")
 	
-	// 移除多余空白
-	text = strings.Join(strings.Fields(text), " ")
+	// 处理多行空白
+	lines := strings.Split(output, "\n")
+	var cleanedLines []string
 	
-	return text
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			cleanedLines = append(cleanedLines, trimmed)
+		}
+	}
+	
+	return strings.Join(cleanedLines, "\n")
 }
 
-// min 返回两个整数中的较小值
-func min(a, b int) int {
-	if a < b {
-		return a
+// 提取文本中的链接
+func extractLinksFromText(content string) []model.Link {
+	var allLinks []model.Link
+	
+	lines := strings.Split(content, "\n")
+	
+	// 收集所有可能的链接信息
+	var linkInfos []struct {
+		link     model.Link
+		position int
+		category string
 	}
-	return b
+	
+	// 收集所有可能的密码信息
+	var passwordInfos []struct {
+		keyword   string
+		position  int
+		password  string
+	}
+	
+	// 第一遍：查找所有的链接和密码
+	for i, line := range lines {
+		// 检查链接
+		line = strings.TrimSpace(line)
+		
+		// 检查百度网盘
+		if strings.Contains(line, "pan.baidu.com") {
+			url := extractURLFromText(line)
+			if url != "" {
+				linkInfos = append(linkInfos, struct {
+					link     model.Link
+					position int
+					category string
+				}{
+					link:     model.Link{URL: url, Type: "baidu"},
+					position: i,
+					category: "baidu",
+				})
+			}
+		}
+		
+		// 检查阿里云盘
+		if strings.Contains(line, "aliyundrive.com") {
+			url := extractURLFromText(line)
+			if url != "" {
+				linkInfos = append(linkInfos, struct {
+					link     model.Link
+					position int
+					category string
+				}{
+					link:     model.Link{URL: url, Type: "aliyun"},
+					position: i,
+					category: "aliyun",
+				})
+			}
+		}
+		
+		// 检查蓝奏云
+		if strings.Contains(line, "lanzou") {
+			url := extractURLFromText(line)
+			if url != "" {
+				linkInfos = append(linkInfos, struct {
+					link     model.Link
+					position int
+					category string
+				}{
+					link:     model.Link{URL: url, Type: "lanzou"},
+					position: i,
+					category: "lanzou",
+				})
+			}
+		}
+		
+		// 检查天翼云盘
+		if strings.Contains(line, "cloud.189.cn") {
+			url := extractURLFromText(line)
+			if url != "" {
+				linkInfos = append(linkInfos, struct {
+					link     model.Link
+					position int
+					category string
+				}{
+					link:     model.Link{URL: url, Type: "tianyi"},
+					position: i,
+					category: "tianyi",
+				})
+			}
+		}
+		
+		// 检查提取码/密码/访问码
+		passwordKeywords := []string{"提取码", "密码", "访问码"}
+		for _, keyword := range passwordKeywords {
+			if strings.Contains(line, keyword) {
+				// 寻找冒号后面的内容
+				colonPos := strings.Index(line, ":")
+				if colonPos == -1 {
+					colonPos = strings.Index(line, "：")
+				}
+				
+				if colonPos != -1 && colonPos+1 < len(line) {
+					password := strings.TrimSpace(line[colonPos+1:])
+					// 如果密码长度超过10个字符，可能不是密码
+					if len(password) <= 10 {
+						passwordInfos = append(passwordInfos, struct {
+							keyword   string
+							position  int
+							password  string
+						}{
+							keyword:   keyword,
+							position:  i,
+							password:  password,
+						})
+					}
+				}
+			}
+		}
+	}
+	
+	// 第二遍：将密码与链接匹配
+	for i := range linkInfos {
+		// 检查链接自身是否包含密码
+		password := extractPasswordFromURL(linkInfos[i].link.URL)
+		if password != "" {
+			linkInfos[i].link.Password = password
+			continue
+		}
+		
+		// 查找最近的密码
+		minDistance := 1000000
+		var closestPassword string
+		
+		for _, pwInfo := range passwordInfos {
+			// 根据链接类型和密码关键词进行匹配
+			match := false
+			
+			if linkInfos[i].category == "baidu" && (pwInfo.keyword == "提取码" || pwInfo.keyword == "密码") {
+				match = true
+			} else if linkInfos[i].category == "aliyun" && (pwInfo.keyword == "提取码" || pwInfo.keyword == "密码") {
+				match = true
+			} else if linkInfos[i].category == "lanzou" && pwInfo.keyword == "密码" {
+				match = true
+			} else if linkInfos[i].category == "tianyi" && (pwInfo.keyword == "访问码" || pwInfo.keyword == "密码") {
+				match = true
+			}
+			
+			if match {
+				distance := abs(pwInfo.position - linkInfos[i].position)
+				if distance < minDistance {
+					minDistance = distance
+					closestPassword = pwInfo.password
+				}
+			}
+		}
+		
+		// 只有当距离较近时才认为是匹配的密码
+		if minDistance <= 3 {
+			linkInfos[i].link.Password = closestPassword
+		}
+	}
+	
+	// 收集所有有效链接
+	for _, info := range linkInfos {
+		allLinks = append(allLinks, info.link)
+	}
+	
+	return allLinks
+}
+
+// 从文本中提取URL
+func extractURLFromText(text string) string {
+	// 查找URL的起始位置
+	urlPrefixes := []string{"http://", "https://"}
+	start := -1
+	
+	for _, prefix := range urlPrefixes {
+		pos := strings.Index(text, prefix)
+		if pos != -1 {
+			start = pos
+			break
+		}
+	}
+	
+	if start == -1 {
+		return ""
+	}
+	
+	// 查找URL的结束位置
+	end := len(text)
+	endChars := []string{" ", "\t", "\n", "\"", "'", "<", ">", ")", "]", "}", ",", ";"}
+	
+	for _, char := range endChars {
+		pos := strings.Index(text[start:], char)
+		if pos != -1 && start+pos < end {
+			end = start + pos
+		}
+	}
+	
+	return text[start:end]
+}
+
+// 从URL中提取密码
+func extractPasswordFromURL(url string) string {
+	// 查找密码参数
+	pwdParams := []string{"pwd=", "password=", "passcode=", "code="}
+	
+	for _, param := range pwdParams {
+		pos := strings.Index(url, param)
+		if pos != -1 {
+			start := pos + len(param)
+			end := len(url)
+			
+			// 查找参数结束位置
+			for i := start; i < len(url); i++ {
+				if url[i] == '&' || url[i] == '#' {
+					end = i
+					break
+				}
+			}
+			
+			if start < end {
+				return url[start:end]
+			}
+		}
+	}
+	
+	return ""
+}
+
+// 绝对值函数
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
 }
 
 // Pan666Response API响应结构
@@ -529,7 +696,7 @@ type Pan666Response struct {
 	Included []Pan666Post       `json:"included"`
 }
 
-// Pan666Discussion 讨论数据结构
+// Pan666Discussion 讨论信息
 type Pan666Discussion struct {
 	Type       string `json:"type"`
 	ID         string `json:"id"`
@@ -552,7 +719,7 @@ type Pan666Discussion struct {
 	} `json:"relationships"`
 }
 
-// Pan666Post 帖子内容结构
+// Pan666Post 帖子内容
 type Pan666Post struct {
 	Type       string `json:"type"`
 	ID         string `json:"id"`
@@ -562,224 +729,4 @@ type Pan666Post struct {
 		ContentType string `json:"contentType"`
 		ContentHTML string `json:"contentHtml"`
 	} `json:"attributes"`
-} 
-
-// extractLinksFromText 从清理后的文本中提取网盘链接
-func extractLinksFromText(content string) []model.Link {
-	// 定义网盘类型及其对应的链接关键词
-	categories := map[string][]string{
-		"magnet":  {"magnet"},                                                                  // 磁力链接
-		"ed2k":    {"ed2k"},                                                                    // 电驴链接
-		"uc":      {"drive.uc.cn"},                                                             // UC网盘
-		"mobile":  {"caiyun.139.com"},                                                          // 移动云盘
-		"tianyi":  {"cloud.189.cn"},                                                            // 天翼云盘
-		"quark":   {"pan.quark.cn"},                                                            // 夸克网盘
-		"115":     {"115cdn.com", "115.com", "anxia.com"},                                      // 115网盘
-		"aliyun":  {"alipan.com", "aliyundrive.com"},                                           // 阿里云盘
-		"pikpak":  {"mypikpak.com"},                                                            // PikPak网盘
-		"baidu":   {"pan.baidu.com"},                                                           // 百度网盘
-		"123":     {"123684.com", "123685.com", "123912.com", "123pan.com", "123pan.cn", "123592.com"}, // 123网盘
-		"lanzou":  {"lanzou", "lanzoux"},                                                       // 蓝奏云
-		"xunlei":  {"pan.xunlei.com"},                                                          // 迅雷网盘
-		"weiyun":  {"weiyun.com"},                                                              // 微云
-		"jianguoyun": {"jianguoyun.com"},                                                       // 坚果云
-	}
-	
-	// 存储所有找到的链接及其在文本中的位置
-	type linkInfo struct {
-		link     model.Link
-		position int
-		category string
-	}
-	var allLinks []linkInfo
-	
-	// 第一步：提取所有链接及其位置
-	for category, patterns := range categories {
-		for _, pattern := range patterns {
-			pos := 0
-			for {
-				idx := strings.Index(content[pos:], pattern)
-				if idx == -1 {
-					break
-				}
-				
-				// 计算实际位置
-				actualPos := pos + idx
-				
-				// 提取URL
-				url := extractURLFromText(content[actualPos:])
-				if url != "" {
-					// 检查URL是否已包含密码参数
-					password := extractPasswordFromURL(url)
-					
-					// 创建链接
-					link := model.Link{
-						Type:     category,
-						URL:      url,
-						Password: password,
-					}
-					
-					// 存储链接及其位置
-					allLinks = append(allLinks, linkInfo{
-						link:     link,
-						position: actualPos,
-						category: category,
-					})
-				}
-				
-				// 移动位置继续查找
-				pos = actualPos + len(pattern)
-			}
-		}
-	}
-	
-	// 按位置排序链接
-	sort.Slice(allLinks, func(i, j int) bool {
-		return allLinks[i].position < allLinks[j].position
-	})
-	
-	// 第二步：提取所有密码关键词及其位置
-	type passwordInfo struct {
-		keyword   string
-		position  int
-		password  string
-	}
-	var allPasswords []passwordInfo
-	
-	// 密码关键词
-	pwdKeywords := []string{"提取码", "密码", "提取密码", "pwd", "password", "提取码:", "密码:", "提取密码:", "pwd:", "password:", "提取:"}
-	
-	for _, keyword := range pwdKeywords {
-		pos := 0
-		for {
-			idx := strings.Index(strings.ToLower(content[pos:]), strings.ToLower(keyword))
-			if idx == -1 {
-				break
-			}
-			
-			// 计算实际位置
-			actualPos := pos + idx
-			
-			// 提取密码
-			restContent := content[actualPos+len(keyword):]
-			restContent = strings.TrimLeft(restContent, " :：=")
-			
-			var password string
-			if len(restContent) >= 4 {
-				possiblePwd := strings.TrimSpace(restContent[:4])
-				if !strings.ContainsAny(possiblePwd, "<>\"'\t\n\r") {
-					password = possiblePwd
-				}
-			}
-			
-			if password != "" {
-				allPasswords = append(allPasswords, passwordInfo{
-					keyword:  keyword,
-					position: actualPos,
-					password: password,
-				})
-			}
-			
-			// 移动位置继续查找
-			pos = actualPos + len(keyword)
-		}
-	}
-	
-	// 按位置排序密码
-	sort.Slice(allPasswords, func(i, j int) bool {
-		return allPasswords[i].position < allPasswords[j].position
-	})
-	
-	// 第三步：为每个密码找到它前面最近的链接
-	// 创建链接的副本，用于最终结果
-	finalLinks := make([]model.Link, len(allLinks))
-	for i, linkInfo := range allLinks {
-		finalLinks[i] = linkInfo.link
-	}
-	
-	// 对于每个密码，找到它前面最近的链接
-	for _, pwdInfo := range allPasswords {
-		// 找到密码前面最近的链接
-		var closestLinkIndex int = -1
-		minDistance := 1000000
-		
-		for i, linkInfo := range allLinks {
-			// 只考虑密码前面的链接
-			if linkInfo.position < pwdInfo.position {
-				distance := pwdInfo.position - linkInfo.position
-				
-				// 密码必须在链接后的200个字符内
-				if distance < 200 && distance < minDistance {
-					minDistance = distance
-					closestLinkIndex = i
-				}
-			}
-		}
-		
-		// 如果找到了链接，并且该链接没有从URL中提取的密码
-		if closestLinkIndex != -1 && finalLinks[closestLinkIndex].Password == "" {
-			// 检查这个链接后面是否有其他链接
-			hasNextLink := false
-			for _, linkInfo := range allLinks {
-				// 如果有链接在当前链接和密码之间，说明当前链接不需要密码
-				if linkInfo.position > allLinks[closestLinkIndex].position && 
-				   linkInfo.position < pwdInfo.position {
-					hasNextLink = true
-					break
-				}
-			}
-			
-			// 只有当没有其他链接在当前链接和密码之间时，才将密码关联到链接
-			if !hasNextLink {
-				finalLinks[closestLinkIndex].Password = pwdInfo.password
-			}
-		}
-	}
-	
-	return finalLinks
-}
-
-// extractURLFromText 从文本中提取URL
-func extractURLFromText(text string) string {
-	// 查找URL的结束位置
-	endIdx := strings.IndexAny(text, " \t\n\r\"'<>")
-	if endIdx == -1 {
-		endIdx = len(text)
-	}
-	
-	// 提取URL
-	url := text[:endIdx]
-	
-	// 清理URL
-	url = strings.TrimPrefix(url, "http://")
-	url = strings.TrimPrefix(url, "https://")
-	url = strings.TrimPrefix(url, "www.")
-	
-	return url
-}
-
-// extractPasswordFromURL 从URL中提取密码参数
-func extractPasswordFromURL(url string) string {
-	// 检查URL是否包含密码参数
-	if strings.Contains(url, "?pwd=") {
-		parts := strings.Split(url, "?pwd=")
-		if len(parts) > 1 {
-			// 提取密码参数
-			pwd := parts[1]
-			// 如果密码后面还有其他参数，只取密码部分
-			if idx := strings.IndexAny(pwd, "&?"); idx != -1 {
-				pwd = pwd[:idx]
-			}
-			return pwd
-		}
-	}
-	return ""
-}
-
-// abs 返回整数的绝对值
-func abs(n int) int {
-	if n < 0 {
-		return -n
-	}
-	return n
 } 

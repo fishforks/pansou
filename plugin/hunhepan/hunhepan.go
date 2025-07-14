@@ -2,7 +2,6 @@ package hunhepan
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,12 +11,13 @@ import (
 
 	"pansou/model"
 	"pansou/plugin"
+	"pansou/util/json"
 )
 
 // 在init函数中注册插件
 func init() {
-	// 使用全局超时时间创建插件实例并注册
-	plugin.RegisterGlobalPlugin(NewHunhepanPlugin())
+	// 注册插件
+	plugin.RegisterGlobalPlugin(NewHunhepanAsyncPlugin())
 }
 
 const (
@@ -26,43 +26,33 @@ const (
 	QkpansoAPI  = "https://qkpanso.com/v1/search/disk"
 	KuakeAPI    = "https://kuake8.com/v1/search/disk"
 	
-	// 默认超时时间
-	DefaultTimeout = 6 * time.Second
-	
 	// 默认页大小
 	DefaultPageSize = 30
 )
 
-// HunhepanPlugin 混合盘搜索插件
-type HunhepanPlugin struct {
-	client  *http.Client
-	timeout time.Duration
+// HunhepanAsyncPlugin 混合盘搜索异步插件
+type HunhepanAsyncPlugin struct {
+	*plugin.BaseAsyncPlugin
 }
 
-// NewHunhepanPlugin 创建新的混合盘搜索插件
-func NewHunhepanPlugin() *HunhepanPlugin {
-	timeout := DefaultTimeout
-	
-	return &HunhepanPlugin{
-		client: &http.Client{
-			Timeout: timeout,
-		},
-		timeout: timeout,
+// NewHunhepanAsyncPlugin 创建新的混合盘搜索异步插件
+func NewHunhepanAsyncPlugin() *HunhepanAsyncPlugin {
+	return &HunhepanAsyncPlugin{
+		BaseAsyncPlugin: plugin.NewBaseAsyncPlugin("hunhepan", 3),
 	}
 }
 
-// Name 返回插件名称
-func (p *HunhepanPlugin) Name() string {
-	return "hunhepan"
-}
-
-// Priority 返回插件优先级
-func (p *HunhepanPlugin) Priority() int {
-	return 3 // 中等优先级
-}
-
 // Search 执行搜索并返回结果
-func (p *HunhepanPlugin) Search(keyword string) ([]model.SearchResult, error) {
+func (p *HunhepanAsyncPlugin) Search(keyword string) ([]model.SearchResult, error) {
+	// 生成缓存键
+	cacheKey := keyword
+	
+	// 使用异步搜索基础方法
+	return p.AsyncSearch(keyword, cacheKey, p.doSearch)
+}
+
+// doSearch 实际的搜索实现
+func (p *HunhepanAsyncPlugin) doSearch(client *http.Client, keyword string) ([]model.SearchResult, error) {
 	// 创建结果通道和错误通道
 	resultChan := make(chan []HunhepanItem, 3)
 	errChan := make(chan error, 3)
@@ -74,7 +64,7 @@ func (p *HunhepanPlugin) Search(keyword string) ([]model.SearchResult, error) {
 	// 并行请求三个API
 	go func() {
 		defer wg.Done()
-		items, err := p.searchAPI(HunhepanAPI, keyword)
+		items, err := p.searchAPI(client, HunhepanAPI, keyword)
 		if err != nil {
 			errChan <- fmt.Errorf("hunhepan API error: %w", err)
 			return
@@ -84,7 +74,7 @@ func (p *HunhepanPlugin) Search(keyword string) ([]model.SearchResult, error) {
 	
 	go func() {
 		defer wg.Done()
-		items, err := p.searchAPI(QkpansoAPI, keyword)
+		items, err := p.searchAPI(client, QkpansoAPI, keyword)
 		if err != nil {
 			errChan <- fmt.Errorf("qkpanso API error: %w", err)
 			return
@@ -94,7 +84,7 @@ func (p *HunhepanPlugin) Search(keyword string) ([]model.SearchResult, error) {
 	
 	go func() {
 		defer wg.Done()
-		items, err := p.searchAPI(KuakeAPI, keyword)
+		items, err := p.searchAPI(client, KuakeAPI, keyword)
 		if err != nil {
 			errChan <- fmt.Errorf("kuake API error: %w", err)
 			return
@@ -138,7 +128,7 @@ func (p *HunhepanPlugin) Search(keyword string) ([]model.SearchResult, error) {
 }
 
 // searchAPI 向单个API发送请求
-func (p *HunhepanPlugin) searchAPI(apiURL, keyword string) ([]HunhepanItem, error) {
+func (p *HunhepanAsyncPlugin) searchAPI(client *http.Client, apiURL, keyword string) ([]HunhepanItem, error) {
 	// 构建请求体
 	reqBody := map[string]interface{}{
 		"q":      keyword,
@@ -175,7 +165,7 @@ func (p *HunhepanPlugin) searchAPI(apiURL, keyword string) ([]HunhepanItem, erro
 	}
 	
 	// 发送请求
-	resp, err := p.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
@@ -202,7 +192,7 @@ func (p *HunhepanPlugin) searchAPI(apiURL, keyword string) ([]HunhepanItem, erro
 }
 
 // deduplicateItems 去重处理
-func (p *HunhepanPlugin) deduplicateItems(items []HunhepanItem) []HunhepanItem {
+func (p *HunhepanAsyncPlugin) deduplicateItems(items []HunhepanItem) []HunhepanItem {
 	// 使用map进行去重
 	uniqueMap := make(map[string]HunhepanItem)
 	
@@ -257,7 +247,7 @@ func (p *HunhepanPlugin) deduplicateItems(items []HunhepanItem) []HunhepanItem {
 }
 
 // convertResults 将API响应转换为标准SearchResult格式
-func (p *HunhepanPlugin) convertResults(items []HunhepanItem) []model.SearchResult {
+func (p *HunhepanAsyncPlugin) convertResults(items []HunhepanItem) []model.SearchResult {
 	results := make([]model.SearchResult, 0, len(items))
 	
 	for i, item := range items {
@@ -269,7 +259,11 @@ func (p *HunhepanPlugin) convertResults(items []HunhepanItem) []model.SearchResu
 		}
 		
 		// 创建唯一ID
-		uniqueID := fmt.Sprintf("hunhepan-%d", i)
+		uniqueID := fmt.Sprintf("hunhepan-%s", item.DiskID)
+		if item.DiskID == "" {
+			// 使用索引作为后备
+			uniqueID = fmt.Sprintf("hunhepan-%d", i)
+		}
 		
 		// 解析时间
 		var datetime time.Time
@@ -302,7 +296,7 @@ func (p *HunhepanPlugin) convertResults(items []HunhepanItem) []model.SearchResu
 }
 
 // convertDiskType 将API的网盘类型转换为标准链接类型
-func (p *HunhepanPlugin) convertDiskType(diskType string) string {
+func (p *HunhepanAsyncPlugin) convertDiskType(diskType string) string {
 	switch diskType {
 	case "BDY":
 		return "baidu"
@@ -350,74 +344,6 @@ func cleanTitle(title string) string {
 	
 	// 移除多余的空格
 	return strings.TrimSpace(result)
-}
-
-// replaceAll 替换字符串中的所有子串
-func replaceAll(s, old, new string) string {
-	for {
-		if s2 := replace(s, old, new); s2 == s {
-			return s
-		} else {
-			s = s2
-		}
-	}
-}
-
-// replace 替换字符串中的第一个子串
-func replace(s, old, new string) string {
-	return replace_substr(s, old, new, 1)
-}
-
-// replace_substr 替换字符串中的前n个子串
-func replace_substr(s, old, new string, n int) string {
-	if old == new || n == 0 {
-		return s // 避免无限循环
-	}
-	
-	if old == "" {
-		if len(s) == 0 {
-			return new
-		}
-		return new + s
-	}
-	
-	// 计算结果字符串的长度
-	count := 0
-	t := s
-	for i := 0; i < len(s) && count < n; i += len(old) {
-		if i+len(old) <= len(s) {
-			if s[i:i+len(old)] == old {
-				count++
-				i = i + len(old) - 1
-			}
-		}
-	}
-	
-	if count == 0 {
-		return s
-	}
-	
-	b := make([]byte, len(s)+count*(len(new)-len(old)))
-	bs := b
-	
-	// 替换前n个old为new
-	for i := 0; i < count; i++ {
-		j := 0
-		for j < len(t) {
-			if j+len(old) <= len(t) && t[j:j+len(old)] == old {
-				copy(bs, t[:j])
-				bs = bs[j:]
-				copy(bs, new)
-				bs = bs[len(new):]
-				t = t[j+len(old):]
-				break
-			}
-			j++
-		}
-	}
-	
-	copy(bs, t)
-	return string(b)
 }
 
 // HunhepanResponse API响应结构

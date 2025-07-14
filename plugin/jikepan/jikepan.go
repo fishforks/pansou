@@ -2,59 +2,51 @@ package jikepan
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"pansou/model"
 	"pansou/plugin"
+	"pansou/util/json"
 )
 
 // 在init函数中注册插件
 func init() {
-	// 使用全局超时时间创建插件实例并注册
-	plugin.RegisterGlobalPlugin(NewJikepanPlugin())
+	// 注册插件
+	plugin.RegisterGlobalPlugin(NewJikepanAsyncV2Plugin())
 }
 
 const (
-	// JikepanAPIURL 极客盘API地址
+	// JikepanAPIURL 即刻盘API地址
 	JikepanAPIURL = "https://api.jikepan.xyz/search"
-	// DefaultTimeout 默认超时时间
-	DefaultTimeout = 10 * time.Second
 )
 
-// JikepanPlugin 极客盘搜索插件
-type JikepanPlugin struct {
-	client  *http.Client
-	timeout time.Duration
+// JikepanAsyncV2Plugin 即刻盘搜索异步V2插件
+type JikepanAsyncV2Plugin struct {
+	*plugin.BaseAsyncPlugin
 }
 
-// NewJikepanPlugin 创建新的极客盘搜索插件
-func NewJikepanPlugin() *JikepanPlugin {
-	timeout := DefaultTimeout
-	
-	return &JikepanPlugin{
-		client: &http.Client{
-			Timeout: timeout,
-		},
-		timeout: timeout,
+// NewJikepanAsyncV2Plugin 创建新的即刻盘搜索异步V2插件
+func NewJikepanAsyncV2Plugin() *JikepanAsyncV2Plugin {
+	return &JikepanAsyncV2Plugin{
+		BaseAsyncPlugin: plugin.NewBaseAsyncPlugin("jikepan", 3),
 	}
 }
 
-// Name 返回插件名称
-func (p *JikepanPlugin) Name() string {
-	return "jikepan"
-}
-
-// Priority 返回插件优先级
-func (p *JikepanPlugin) Priority() int {
-	return 3 // 中等优先级
-}
-
 // Search 执行搜索并返回结果
-func (p *JikepanPlugin) Search(keyword string) ([]model.SearchResult, error) {
+func (p *JikepanAsyncV2Plugin) Search(keyword string) ([]model.SearchResult, error) {
+	// 生成缓存键
+	cacheKey := keyword
+	
+	// 使用异步搜索基础方法
+	return p.AsyncSearch(keyword, cacheKey, p.doSearch)
+}
+
+// doSearch 实际的搜索实现
+func (p *JikepanAsyncV2Plugin) doSearch(client *http.Client, keyword string) ([]model.SearchResult, error) {
 	// 构建请求
 	reqBody := map[string]interface{}{
 		"name":   keyword,
@@ -76,7 +68,7 @@ func (p *JikepanPlugin) Search(keyword string) ([]model.SearchResult, error) {
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
 	
 	// 发送请求
-	resp, err := p.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
@@ -84,7 +76,12 @@ func (p *JikepanPlugin) Search(keyword string) ([]model.SearchResult, error) {
 	
 	// 解析响应
 	var apiResp JikepanResponse
-	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response body failed: %w", err)
+	}
+	
+	if err := json.Unmarshal(bodyBytes, &apiResp); err != nil {
 		return nil, fmt.Errorf("decode response failed: %w", err)
 	}
 	
@@ -94,11 +91,13 @@ func (p *JikepanPlugin) Search(keyword string) ([]model.SearchResult, error) {
 	}
 	
 	// 转换结果格式
-	return p.convertResults(apiResp.List), nil
+	results := p.convertResults(apiResp.List)
+	
+	return results, nil
 }
 
 // convertResults 将API响应转换为标准SearchResult格式
-func (p *JikepanPlugin) convertResults(items []JikepanItem) []model.SearchResult {
+func (p *JikepanAsyncV2Plugin) convertResults(items []JikepanItem) []model.SearchResult {
 	results := make([]model.SearchResult, 0, len(items))
 	
 	for i, item := range items {
@@ -137,7 +136,7 @@ func (p *JikepanPlugin) convertResults(items []JikepanItem) []model.SearchResult
 		result := model.SearchResult{
 			UniqueID:  uniqueID,
 			Title:     item.Name,
-			Datetime:  time.Time{}, // 使用零值表示无时间，而不是time.Now()
+			Datetime:  time.Time{}, // 使用零值而不是nil
 			Links:     links,
 		}
 		
@@ -148,7 +147,7 @@ func (p *JikepanPlugin) convertResults(items []JikepanItem) []model.SearchResult
 }
 
 // convertLinkType 将API的服务类型转换为标准链接类型
-func (p *JikepanPlugin) convertLinkType(service string) string {
+func (p *JikepanAsyncV2Plugin) convertLinkType(service string) string {
 	service = strings.ToLower(service)
 	
 	switch service {
@@ -192,7 +191,7 @@ func (p *JikepanPlugin) convertLinkType(service string) string {
 
 // JikepanResponse API响应结构
 type JikepanResponse struct {
-	Msg  string       `json:"msg"`
+	Msg  string        `json:"msg"`
 	List []JikepanItem `json:"list"`
 }
 
@@ -202,7 +201,7 @@ type JikepanItem struct {
 	Links []JikepanLink `json:"links"`
 }
 
-// JikepanLink API响应中的链接
+// JikepanLink API响应中的链接信息
 type JikepanLink struct {
 	Service string `json:"service"`
 	Link    string `json:"link"`

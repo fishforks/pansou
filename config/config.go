@@ -30,6 +30,13 @@ type Config struct {
 	// 插件相关配置
 	PluginTimeoutSeconds int           // 插件超时时间（秒）
 	PluginTimeout        time.Duration // 插件超时时间（Duration）
+	// 异步插件相关配置
+	AsyncPluginEnabled        bool          // 是否启用异步插件
+	AsyncResponseTimeout      int           // 响应超时时间（秒）
+	AsyncResponseTimeoutDur   time.Duration // 响应超时时间（Duration）
+	AsyncMaxBackgroundWorkers int           // 最大后台工作者数量
+	AsyncMaxBackgroundTasks   int           // 最大后台任务数量
+	AsyncCacheTTLHours        int           // 异步缓存有效期（小时）
 }
 
 // 全局配置实例
@@ -39,6 +46,7 @@ var AppConfig *Config
 func Init() {
 	proxyURL := getProxyURL()
 	pluginTimeoutSeconds := getPluginTimeout()
+	asyncResponseTimeoutSeconds := getAsyncResponseTimeout()
 	
 	AppConfig = &Config{
 		DefaultChannels:    getDefaultChannels(),
@@ -60,6 +68,13 @@ func Init() {
 		// 插件相关配置
 		PluginTimeoutSeconds: pluginTimeoutSeconds,
 		PluginTimeout:        time.Duration(pluginTimeoutSeconds) * time.Second,
+		// 异步插件相关配置
+		AsyncPluginEnabled:        getAsyncPluginEnabled(),
+		AsyncResponseTimeout:      asyncResponseTimeoutSeconds,
+		AsyncResponseTimeoutDur:   time.Duration(asyncResponseTimeoutSeconds) * time.Second,
+		AsyncMaxBackgroundWorkers: getAsyncMaxBackgroundWorkers(),
+		AsyncMaxBackgroundTasks:   getAsyncMaxBackgroundTasks(),
+		AsyncCacheTTLHours:        getAsyncCacheTTLHours(),
 	}
 	
 	// 应用GC配置
@@ -92,7 +107,7 @@ func getDefaultConcurrency() int {
 func getPort() string {
 	port := os.Getenv("PORT")
 	if port == "" {
-		return "8080"
+		return "8888"
 	}
 	return port
 }
@@ -206,6 +221,67 @@ func getPluginTimeout() int {
 		return 30
 	}
 	return timeout
+}
+
+// 从环境变量获取是否启用异步插件，如果未设置则默认启用
+func getAsyncPluginEnabled() bool {
+	enabled := os.Getenv("ASYNC_PLUGIN_ENABLED")
+	if enabled == "" {
+		return true // 默认启用
+	}
+	return enabled != "false" && enabled != "0"
+}
+
+// 从环境变量获取异步响应超时时间（秒），如果未设置则使用默认值
+func getAsyncResponseTimeout() int {
+	timeoutEnv := os.Getenv("ASYNC_RESPONSE_TIMEOUT")
+	if timeoutEnv == "" {
+		return 4 // 默认4秒
+	}
+	timeout, err := strconv.Atoi(timeoutEnv)
+	if err != nil || timeout <= 0 {
+		return 4
+	}
+	return timeout
+}
+
+// 从环境变量获取最大后台工作者数量，如果未设置则使用默认值
+func getAsyncMaxBackgroundWorkers() int {
+	sizeEnv := os.Getenv("ASYNC_MAX_BACKGROUND_WORKERS")
+	if sizeEnv == "" {
+		return 20 // 默认20个工作者
+	}
+	size, err := strconv.Atoi(sizeEnv)
+	if err != nil || size <= 0 {
+		return 20
+	}
+	return size
+}
+
+// 从环境变量获取最大后台任务数量，如果未设置则使用默认值
+func getAsyncMaxBackgroundTasks() int {
+	sizeEnv := os.Getenv("ASYNC_MAX_BACKGROUND_TASKS")
+	if sizeEnv == "" {
+		return 100 // 默认100个任务
+	}
+	size, err := strconv.Atoi(sizeEnv)
+	if err != nil || size <= 0 {
+		return 100
+	}
+	return size
+}
+
+// 从环境变量获取异步缓存有效期（小时），如果未设置则使用默认值
+func getAsyncCacheTTLHours() int {
+	ttlEnv := os.Getenv("ASYNC_CACHE_TTL_HOURS")
+	if ttlEnv == "" {
+		return 1 // 默认1小时
+	}
+	ttl, err := strconv.Atoi(ttlEnv)
+	if err != nil || ttl <= 0 {
+		return 1
+	}
+	return ttl
 }
 
 // 应用GC设置
